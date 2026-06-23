@@ -3,7 +3,7 @@ name: Linkareer Discord Bot Automation
 on:
   schedule:
     # 매 시간 정각마다 실행 (UTC 기준이므로 한국 시간 계산 필요 없이 정기적으로 실행됩니다)
-    - cron: '0 * * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch: # 깃허브 웹사이트에서 수동으로 실행 버튼을 누를 수 있게 해주는 옵션
 
 jobs:
