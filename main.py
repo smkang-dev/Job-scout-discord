@@ -6,6 +6,8 @@ from urllib.parse import urljoin
 
 # 1. 환경설정
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK")
+if not DISCORD_WEBHOOK_URL:
+    raise ValueError("DISCORD_WEBHOOK 환경변수가 설정되지 않았습니다.")
 TARGET_KEYWORDS = ["백엔드", "backend", "전산직", "it", "db", "java", "python"]
 DB_FILE = "sent_jobs.json"
 
