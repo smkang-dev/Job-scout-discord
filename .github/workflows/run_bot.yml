@@ -33,7 +33,7 @@ jobs:
     - name: 중복 방지 파일(sent_jobs.json) 변경사항 깃허브에 자동 저장
       run: |
         git config --global user.name 'github-actions[bot]'
-        git config --global user.email 'github-actions[bot]@://github.com'
+        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
         git add sent_jobs.json
         # 변경사항(새로 보낸 채용공고 기록)이 있을 때만 깃허브 저장소에 Push합니다.
         git diff --quiet && git diff --staged --quiet || (git commit -m "Update sent_jobs.json" && git push)
