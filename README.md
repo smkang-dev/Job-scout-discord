@@ -4,7 +4,7 @@
 
 GitHub Actions를 이용해 매일 자동 실행되며, Discord Webhook 주소는 GitHub Secrets로 관리합니다.
 
----
+--- 
 
 ## 주요 기능
 
