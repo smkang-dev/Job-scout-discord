@@ -52,7 +52,7 @@ GitHub Actions를 이용해 매일 자동 실행되며, Discord Webhook 주소�
 Job-scout-discord
 ├─ .github
 │  └─ workflows
-│     └─ main.yml
+│     └─ run_bot.yml
 ├─ main.py
 ├─ sent_jobs.json
 └─ README.md
