@@ -94,8 +94,6 @@ def main():
             if link in jobs:
                 continue
 
-            search_target_text = " ".join(cleaned_text[1:]).lower()
-
             for keyword in TARGET_KEYWORDS:
                 if keyword and keyword.lower() in title.lower():
                     send_to_discord(company, title, link, keyword)
