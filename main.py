@@ -1,111 +1,314 @@
-import json
+"""Linkareer scheduled notifier. Importing this module never sends messages."""
+
+import argparse
+import logging
+import math
 import os
+import re
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
 
-# 1. 환경설정
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK")
-if not DISCORD_WEBHOOK_URL:
-    raise ValueError("DISCORD_WEBHOOK 환경변수가 설정되지 않았습니다.")
+from state import BASE_URL, State, StateError, canonical_url, state_lock
+
+LOG = logging.getLogger("job_scout")
 TARGET_KEYWORDS = ["백엔드", "backend", "전산직", "it", "db", "java", "python"]
-DB_FILE = "sent_jobs.json"
+LIST_URL = BASE_URL + "/list/recruit"
+TIMEOUT = (5, 20)
 
 
-# 2. 알림 보낸 채용공고 데이터 로드
-def load_sent_jobs():
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
+class BotError(RuntimeError):
+    pass
 
 
-# 3. 알림 보낸 채용공고 저장
-def save_sent_jobs(jobs):
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(jobs, f, ensure_ascii=False, indent=4)
+class DeliveryRejected(BotError):
+    """A definitive rejection: eligible for a future scheduled attempt."""
 
 
-# 4. 디스코드 웹훅으로 데이터 전송
-def send_to_discord(company, title, url, matched_keyword):
-    payload = {"embeds": [{"title": f"매칭된 채용 공고: {company}", "description": f"**[{title}]({url})**",
-                           "color": 3447003, "fields":
-                               [{"name": "감지된 키워드", "value": f"{matched_keyword}", "inline": True, }],
-                           "footer": {"text": "링커리어 실시간 채용 알리미"}}]}
-    try:
-        res = requests.post(DISCORD_WEBHOOK_URL, json=payload)
-        if res.status_code not in [200, 204]:
-            print(f"디스코드 전송 실패 (상태코드 {res.status_code}): {res.text}")
-    except Exception as e:
-        print(f"디스코드 전송 오류: {e}")
+class DeliveryUnknown(BotError):
+    """Delivery may have happened. Never retry this automatically."""
 
 
-# 5. 메인 크롤링 및 필터링 로직
-def main():
-    jobs = load_sent_jobs()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+@dataclass(frozen=True)
+class Job:
+    company: str
+    title: str
+    url: str
 
-    url = "https://linkareer.com/list/recruit"
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        print("사이트 요청 실패")
-        return
-    soup = BeautifulSoup(response.text, "html.parser")
 
-    # 공고 페이지 링크를 품고 있는 a 태그 수집
-    job_items = [
-        tag for tag in soup.find_all("a", href=True)
-        if "/activity/" in tag["href"] or "/recruit/" in tag["href"]
-    ]
-    print(f"총 {len(job_items)}개의 공고를 발견했습니다. 분석을 시작합니다...")
+def matching_keywords(title):
+    result = []
+    for word in TARGET_KEYWORDS:
+        # ASCII token boundaries avoid matching 'it' in 'digital', 'java' in 'javascript'.
+        match = (
+            re.search(r"(?<![a-z0-9])" + re.escape(word) + r"(?![a-z0-9])", title, re.I)
+            if word.isascii()
+            else word in title
+        )
+        if match:
+            result.append(word)
+    return result
 
-    for item in job_items:
-        try:
-            # 카드 내부의 텍스트 리스트를 순서대로 추출
-            full_text = [t.strip() for t in item.stripped_strings if t.strip()]
 
-            # 링커리어 카테고리 태그 및 마감 찌꺼기 1차 필터링
-            ignored_words = ["대외활동", "공모전", "동아리", "인턴/채용", "채용", "교육", "강연", "마감", "오늘마감", "조회", "Q&A", "댓글"]
-            cleaned_text = [
-                t for t in full_text
-                if not (t.startswith("D-") or t.startswith("👁") or t in ignored_words)
-            ]
-
-            if len(cleaned_text) < 2:
-                continue
-
-            # [핵심 보정] 링커리어 카드 텍스트 배치 특징 저격
-            # 항상 카드 텍스트의 마지막에 '조회수'나 '댓글/Q&A 개수' 같은 노이즈가 남거나 밀리는 현상을 방어하기 위해
-            # 앞의 2개 요소(회사명, 공고제목)만 명확하게 슬라이싱하여 고정합니다.
-            company = cleaned_text[0]
-            title = cleaned_text[1]
-
-            # 회사명과 제목이 2글자 이하의 비정상 데이터이거나 숫자로만 이루어진 노이즈라면 패스
-            if len(company) <= 1 or len(title) <= 3 or title.isdigit():
-                continue
-
-            link = urljoin("https://linkareer.com", item["href"])
-            print(f"{company} {title} {link}")
-
-            if link in jobs:
-                continue
-
-            for keyword in TARGET_KEYWORDS:
-                if keyword and keyword.lower() in title.lower():
-                    send_to_discord(company, title, link, keyword)
-                    jobs.append(link)
-                    print(f"알림 발송 완료: {company} - {title}")
-                    break
-        except Exception as e:
-            print(f"카드 파싱 중 예외 발생: {e}")
+def parse_jobs(html):
+    soup = BeautifulSoup(html, "html.parser")
+    jobs, skipped = {}, 0
+    # Observed Linkareer desktop rows: company and title are in separate cells.
+    # Never guess from text position: recommendation labels and categories are not titles.
+    for tag in soup.select("a.recruit-link[href]"):
+        url = canonical_url(tag["href"])
+        if url is None:
             continue
-    save_sent_jobs(jobs)
-    print("크롤링 및 데이터 저장 완료")
+        row = tag.find_parent("tr")
+        title_node = tag.select_one(".recruit-name")
+        company_node = row.select_one(".company-name") if row else None
+        if title_node is None or company_node is None:
+            skipped += 1
+            continue
+        company = company_node.get_text(" ", strip=True)
+        title = title_node.get_text(" ", strip=True)
+        if not company or not title or title.isdigit():
+            skipped += 1
+            continue
+        jobs.setdefault(url, Job(company, title, url))
+    if not jobs:
+        raise BotError(
+            "파싱 가능한 공고가 0개입니다. HTML 구조 변경·접근 차단 여부를 확인하세요."
+        )
+    LOG.info("parsed=%d skipped_cards=%d", len(jobs), skipped)
+    return list(jobs.values())
+
+
+def fetch_html(session, sleep=time.sleep):
+    for attempt in range(3):
+        try:
+            response = session.get(
+                LIST_URL,
+                headers={"User-Agent": "Mozilla/5.0 JobScout/1.0"},
+                timeout=TIMEOUT,
+            )
+        except requests.RequestException:
+            if attempt == 2:
+                raise BotError("공고 목록 요청 실패: 네트워크 또는 타임아웃") from None
+        else:
+            if response.status_code == 200:
+                return response.text
+            if response.status_code not in (500, 502, 503, 504):
+                raise BotError(
+                    f"공고 목록 HTTP {response.status_code}; 접근 조건을 확인하세요."
+                )
+            if attempt == 2:
+                raise BotError(
+                    f"공고 목록 HTTP {response.status_code}; 조회 재시도 소진"
+                )
+        sleep(2**attempt)
+    raise BotError("공고 목록 요청 실패")
+
+
+def webhook_url(value):
+    # Never include the URL or the original Requests exception in logs.
+    try:
+        u = urlsplit(value or "")
+        if (
+            u.scheme != "https"
+            or u.hostname not in ("discord.com", "discordapp.com")
+            or u.username
+            or u.password
+            or u.port not in (None, 443)
+            or not re.fullmatch(r"/api(?:/v\d+)?/webhooks/\d+/[\w.-]+", u.path)
+        ):
+            raise ValueError()
+    except ValueError:
+        raise BotError(
+            "DISCORD_WEBHOOK에 올바른 Discord Webhook URL을 설정하세요."
+        ) from None
+    query = [(k, v) for k, v in parse_qsl(u.query) if k != "wait"]
+    query.append(("wait", "true"))
+    return urlunsplit((u.scheme, u.netloc, u.path, urlencode(query), ""))
+
+
+def clip(value, units):
+    return value.encode("utf-16-le")[: units * 2].decode("utf-16-le", errors="ignore")
+
+
+def payload(job, keywords):
+    return {
+        "allowed_mentions": {"parse": []},
+        "embeds": [
+            {
+                "title": clip("매칭된 채용 공고: " + job.company, 256),
+                "description": clip(job.title, 3500),
+                "url": job.url,
+                "color": 3447003,
+                "fields": [
+                    {
+                        "name": "감지된 키워드",
+                        "value": ", ".join(keywords),
+                        "inline": True,
+                    }
+                ],
+                "footer": {"text": "링커리어 채용 알리미 · 일일 수집"},
+            }
+        ],
+    }
+
+
+def send_to_discord(session, endpoint, job, keywords, sleep=time.sleep):
+    for attempt in range(3):
+        try:
+            response = session.post(
+                endpoint,
+                json=payload(job, keywords),
+                timeout=TIMEOUT,
+                allow_redirects=False,
+            )
+        except requests.RequestException:
+            raise DeliveryUnknown(
+                "Discord 응답을 확인하지 못했습니다. 자동 재전송을 보류합니다."
+            ) from None
+        if response.status_code == 200:
+            try:
+                message = response.json()
+            except ValueError:
+                message = None
+            if isinstance(message, dict) and str(message.get("id", "")).isdigit():
+                return str(message["id"])
+            raise DeliveryUnknown(
+                "Discord 성공 응답에 메시지 ID가 없어 결과 확인이 필요합니다."
+            )
+        if response.status_code == 429:
+            try:
+                data = response.json()
+                delay = float(
+                    data.get("retry_after", response.headers.get("Retry-After"))
+                )
+            except (ValueError, TypeError, AttributeError):
+                raise DeliveryRejected(
+                    "Discord 429: 재시도 대기 시간을 확인할 수 없습니다."
+                ) from None
+            if not math.isfinite(delay) or delay < 0 or delay > 60 or attempt == 2:
+                raise DeliveryRejected("Discord 429: 이번 실행의 재시도를 중단합니다.")
+            sleep(delay + 0.1)
+            continue
+        if 400 <= response.status_code < 500:
+            raise DeliveryRejected(
+                f"Discord HTTP {response.status_code}: Webhook·메시지 설정을 확인하세요."
+            )
+        raise DeliveryUnknown(
+            f"Discord HTTP {response.status_code}: 발송 여부를 직접 확인하세요."
+        )
+    raise DeliveryRejected("Discord 재시도 소진")
+
+
+def process(jobs, state, session, mode="dry-run", endpoint=None, sleep=time.sleep):
+    candidates = [(j, matching_keywords(j.title)) for j in jobs]
+    candidates = [(j, k) for j, k in candidates if k]
+    fresh = [
+        (j, k)
+        for j, k in candidates
+        if j.url not in state.sent and j.url not in state.pending
+    ]
+    LOG.info(
+        "matched=%d new=%d sent_total=%d pending=%d mode=%s",
+        len(candidates),
+        len(fresh),
+        len(state.sent),
+        len(state.pending),
+        mode,
+    )
+    for job, keywords in fresh:
+        LOG.info(
+            "candidate title=%s url=%s keywords=%s",
+            job.title,
+            job.url,
+            ",".join(keywords),
+        )
+    if mode == "dry-run":
+        return len(fresh)
+    if mode == "baseline":
+        state.baseline(j.url for j, _ in candidates)
+        LOG.info("현재 매칭 공고를 알림 없이 처리 기록에 등록했습니다.")
+    elif mode == "send":
+        if endpoint is None:
+            raise BotError("Webhook 설정이 없습니다.")
+        for job, keywords in fresh:
+            state.begin(job.url)  # Persist BEFORE the external side effect.
+            try:
+                message_id = send_to_discord(session, endpoint, job, keywords, sleep)
+            except DeliveryRejected:
+                state.reject(job.url)  # Known failure is not recorded as sent.
+                raise
+            state.confirm(job.url)
+            LOG.info("sent url=%s message_id=%s", job.url, message_id)
+    else:
+        raise BotError("알 수 없는 실행 모드")
+    if state.pending:
+        raise BotError(
+            f"발송 여부 확인이 필요한 공고 {len(state.pending)}개가 pending_jobs.json에 있습니다."
+        )
+    return len(fresh)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Job Scout Discord Bot")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--dry-run", action="store_true", help="조회만 수행; 전송/기록 변경 없음"
+    )
+    group.add_argument(
+        "--baseline",
+        action="store_true",
+        help="현재 매칭 공고를 전송 없이 처리 기록에 추가",
+    )
+    group.add_argument(
+        "--resolve-sent", metavar="URL", help="Discord에서 수신을 확인한 보류 공고 처리"
+    )
+    group.add_argument(
+        "--resolve-retry",
+        metavar="URL",
+        help="미수신을 확인한 보류 공고를 다음 실행에서 재시도 허용",
+    )
+    parser.add_argument(
+        "--state-dir", type=Path, default=Path(__file__).resolve().parent
+    )
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    try:
+        with state_lock(args.state_dir):
+            state = State(args.state_dir)
+            if args.resolve_sent or args.resolve_retry:
+                url = canonical_url(args.resolve_sent or args.resolve_retry)
+                if url not in state.pending:
+                    raise StateError("지정한 URL은 보류 목록에 없습니다.")
+                state.confirm(url) if args.resolve_sent else state.reject(url)
+                LOG.info("보류 기록 처리 완료: %s (이번 명령은 전송하지 않음)", url)
+                return 0
+            mode = (
+                "dry-run" if args.dry_run else "baseline" if args.baseline else "send"
+            )
+            endpoint = (
+                webhook_url(os.environ.get("DISCORD_WEBHOOK"))
+                if mode == "send"
+                else None
+            )
+            with requests.Session() as session:
+                jobs = parse_jobs(fetch_html(session))
+                process(jobs, state, session, mode, endpoint)
+        return 0
+    except (BotError, StateError) as exc:
+        LOG.error("%s", exc)
+        return 1
+    except OSError:
+        LOG.error(
+            "상태 파일 저장 실패. 실행을 중단합니다. 기존 기록과 보류 기록을 확인하세요."
+        )
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
