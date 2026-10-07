@@ -1,13 +1,14 @@
 """Linkareer scheduled notifier. Importing this module never sends messages."""
 
 import argparse
+import json
 import logging
 import math
 import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -19,7 +20,9 @@ from state import BASE_URL, State, StateError, canonical_url, state_lock
 LOG = logging.getLogger("job_scout")
 TARGET_KEYWORDS = ["백엔드", "backend", "전산직", "it", "db", "java", "python"]
 LIST_URL = BASE_URL + "/list/recruit"
-TIMEOUT = (5, 20)
+TIMEOUT = (10, 25)
+DEFAULT_PAGES = 5
+CATEGORY_KEYWORDS = ("IT/개발", "백엔드", "서버개발", "전산", "정보보안", "데이터엔지니어", "DBA")
 
 
 class BotError(RuntimeError):
@@ -39,6 +42,7 @@ class Job:
     company: str
     title: str
     url: str
+    categories: tuple = field(default=(), compare=False)
 
 
 def matching_keywords(title):
@@ -55,11 +59,64 @@ def matching_keywords(title):
     return result
 
 
-def parse_jobs(html):
+def page_metadata(soup):
+    """Read only the public SSR data embedded in the list HTML."""
+    node = soup.find("script", id="__NEXT_DATA__")
+    if node is None:
+        return {}, None
+    try:
+        data = json.loads(node.string or node.get_text())
+        cache = data["props"]["pageProps"]["__APOLLO_STATE__"]
+        if not isinstance(cache, dict):
+            raise ValueError()
+        pages = []
+        for key, value in cache.get("ROOT_QUERY", {}).items():
+            if not key.startswith("activities(") or not key.endswith(")"):
+                continue
+            args = json.loads(key[len("activities("):-1])
+            if str(args.get("filterBy", {}).get("activityTypeID")) != "5":
+                continue
+            pagination = args["pagination"]
+            page, size, total = pagination["page"], pagination["pageSize"], value["totalCount"]
+            if any(type(x) is not int for x in (page, size, total)) or page < 1 or size < 1 or total < 0:
+                raise ValueError()
+            ids = tuple(x["__ref"] for x in value["nodes"])
+            pages.append((page, size, total, ids))
+        if len(pages) > 1:
+            raise ValueError()
+        return cache, pages[0] if pages else None
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise BotError("목록의 구조화 데이터가 변경됐습니다. 수집을 중단합니다.") from None
+
+
+def job_categories(cache, url, tag):
+    labels = []
+    activity = cache.get("Activity:" + url.rsplit("/", 1)[-1], {})
+    def visit(ref, seen):
+        if not isinstance(ref, dict):
+            return
+        key = ref.get("__ref")
+        if not key or key in seen or len(seen) >= 6:
+            return
+        seen = seen | {key}
+        category = cache.get(key, {})
+        name = category.get("name")
+        if isinstance(name, str) and name and name != "전체":
+            labels.append(name)
+        visit(category.get("parent"), seen)
+    for ref in activity.get("categories", []):
+        visit(ref, set())
+    # Retain the visible classification as a fallback; never use it as a title.
+    visible = tag.select_one(".recruit-category")
+    if visible:
+        labels.append(visible.get_text(" ", strip=True))
+    return tuple(dict.fromkeys(label for label in labels if label))
+
+
+def parse_page(html):
     soup = BeautifulSoup(html, "html.parser")
+    cache, meta = page_metadata(soup)
     jobs, skipped = {}, 0
-    # Observed Linkareer desktop rows: company and title are in separate cells.
-    # Never guess from text position: recommendation labels and categories are not titles.
     for tag in soup.select("a.recruit-link[href]"):
         url = canonical_url(tag["href"])
         if url is None:
@@ -75,20 +132,69 @@ def parse_jobs(html):
         if not company or not title or title.isdigit():
             skipped += 1
             continue
-        jobs.setdefault(url, Job(company, title, url))
-    if not jobs:
-        raise BotError(
-            "파싱 가능한 공고가 0개입니다. HTML 구조 변경·접근 차단 여부를 확인하세요."
-        )
+        jobs.setdefault(url, Job(company, title, url, job_categories(cache, url, tag)))
+    # Empty is valid only if the structured source explicitly says no regular items.
+    if not jobs and not (meta is not None and not meta[3]):
+        raise BotError("파싱 가능한 공고가 0개입니다. HTML 구조 변경·접근 차단 여부를 확인하세요.")
+    if skipped:
+        raise BotError(f"회사명 또는 제목을 읽지 못한 공고 {skipped}개가 있습니다.")
+    if meta:
+        parsed_ids = {"Activity:" + url.rsplit("/", 1)[-1] for url in jobs}
+        if not set(meta[3]).issubset(parsed_ids):
+            raise BotError("목록 데이터와 파싱 공고가 일치하지 않습니다. 누락 확인이 필요합니다.")
     LOG.info("parsed=%d skipped_cards=%d", len(jobs), skipped)
-    return list(jobs.values())
+    return list(jobs.values()), meta
 
 
-def fetch_html(session, sleep=time.sleep):
+def parse_jobs(html):
+    return parse_page(html)[0]
+
+
+def match_reasons(job):
+    reasons = ["제목:" + word for word in matching_keywords(job.title)]
+    for word in CATEGORY_KEYWORDS:
+        if any(re.search(re.escape(word), category, re.I) for category in job.categories):
+            reasons.append("직무:" + word)
+    return reasons
+
+
+def collect_jobs(session, max_pages=DEFAULT_PAGES, sleep=time.sleep):
+    if not 1 <= max_pages <= 20:
+        raise BotError("수집 페이지 수는 1~20이어야 합니다.")
+    collected, signatures = {}, set()
+    pages_done = 0
+    for page in range(1, max_pages + 1):
+        if page > 1:
+            sleep(1)
+        url = LIST_URL + "?" + urlencode({"orderBy_direction": "DESC", "orderBy_field": "RECENT", "page": page})
+        jobs, meta = parse_page(fetch_html(session, sleep, url=url))
+        if meta is None:
+            raise BotError("페이지 번호 확인용 데이터가 없습니다. 페이지 수집을 검증할 수 없습니다.")
+        actual_page, size, total, ids = meta
+        if actual_page != page:
+            raise BotError(f"요청 페이지 {page}와 응답 페이지 {actual_page}가 다릅니다.")
+        if ids and ids in signatures:
+            raise BotError("같은 페이지가 반복 반환됐습니다. 발송 전 수집을 중단합니다.")
+        signatures.add(ids)
+        before = len(collected)
+        for job in jobs:
+            collected.setdefault(job.url, job)
+        pages_done += 1
+        LOG.info("page=%d parsed=%d unique_added=%d matched=%d total_listed=%d",
+                 page, len(jobs), len(collected)-before, sum(bool(match_reasons(j)) for j in jobs), total)
+        if page * size >= total or not ids:
+            break
+    LOG.info("collection pages=%d unique=%d title_matches=%d category_only=%d",
+             pages_done, len(collected), sum(bool(matching_keywords(j.title)) for j in collected.values()),
+             sum(bool(match_reasons(j)) and not matching_keywords(j.title) for j in collected.values()))
+    return list(collected.values())
+
+
+def fetch_html(session, sleep=time.sleep, url=LIST_URL):
     for attempt in range(3):
         try:
             response = session.get(
-                LIST_URL,
+                url,
                 headers={"User-Agent": "Mozilla/5.0 JobScout/1.0"},
                 timeout=TIMEOUT,
             )
@@ -147,8 +253,8 @@ def payload(job, keywords):
                 "color": 3447003,
                 "fields": [
                     {
-                        "name": "감지된 키워드",
-                        "value": ", ".join(keywords),
+                        "name": "선정 근거 (제목 / 직무)",
+                        "value": clip(", ".join(keywords), 1024),
                         "inline": True,
                     }
                 ],
@@ -206,7 +312,7 @@ def send_to_discord(session, endpoint, job, keywords, sleep=time.sleep):
 
 
 def process(jobs, state, session, mode="dry-run", endpoint=None, sleep=time.sleep):
-    candidates = [(j, matching_keywords(j.title)) for j in jobs]
+    candidates = [(j, match_reasons(j)) for j in jobs]
     candidates = [(j, k) for j, k in candidates if k]
     fresh = [
         (j, k)
@@ -276,6 +382,7 @@ def main(argv=None):
     parser.add_argument(
         "--state-dir", type=Path, default=Path(__file__).resolve().parent
     )
+    parser.add_argument("--pages", type=int, choices=range(1, 21), default=DEFAULT_PAGES, metavar="1~20", help="최대 수집 페이지 수 (기본 5)")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
@@ -297,7 +404,7 @@ def main(argv=None):
                 else None
             )
             with requests.Session() as session:
-                jobs = parse_jobs(fetch_html(session))
+                jobs = collect_jobs(session, args.pages)
                 process(jobs, state, session, mode, endpoint)
         return 0
     except (BotError, StateError) as exc:
@@ -312,3 +419,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
